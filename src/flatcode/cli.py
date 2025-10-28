@@ -126,6 +126,35 @@ def is_path_ignored(rel_path: Path, rules: List[Tuple[str, bool]]) -> bool:
             
     return ignored
 
+# --- Project Tree Generator ---
+
+def generate_project_tree(file_paths: List[str], root_name: str) -> str:
+    """Generates a string representation of the project tree from a list of file paths."""
+    tree_dict: Dict = {}
+    for path in sorted(file_paths):
+        parts = Path(path).parts
+        current_level = tree_dict
+        for part in parts:
+            if part not in current_level:
+                current_level[part] = {}
+            current_level = current_level[part]
+
+    lines = [f"{root_name}/"]
+
+    def _generate_lines_recursive(subtree: Dict, prefix: str):
+        entries = sorted(subtree.items())
+        for i, (name, content) in enumerate(entries):
+            is_last = (i == len(entries) - 1)
+            connector = "└── " if is_last else "├── "
+            lines.append(f"{prefix}{connector}{name}")
+            
+            if content:  # It's a directory, recurse
+                new_prefix = prefix + ("    " if is_last else "│   ")
+                _generate_lines_recursive(content, new_prefix)
+
+    _generate_lines_recursive(tree_dict, "")
+    return "\n".join(lines) + "\n"
+
 # --- Token Estimator ---
 
 # Initialize a global tokenizer to avoid reloading
@@ -214,10 +243,6 @@ def main():
         files_to_merge: List[Tuple[Path, str, int, str]] = []
         total_files_scanned = 0
         
-        print(f"\n--- Phase 1: Scanning & Estimating Tokens ---")
-        print(f"Using rules from: {mergeignore_file.name}")
-        print(f"Including extensions: {args.extensions}")
-
         for path in root_dir.rglob("*"):
             total_files_scanned += 1
             
@@ -238,7 +263,6 @@ def main():
             try:
                 content = path.read_text(encoding="utf-8")
                 tokens = estimate_tokens(content)
-                print(f"  > [Found] {rel_path.as_posix()} (~{tokens} tokens)")
                 files_to_merge.append((path, rel_path.as_posix(), tokens, content))
             except Exception as e:
                 print(f"  > [Warning] Skipping {rel_path.as_posix()} (read error: {e})", file=sys.stderr)
@@ -247,7 +271,7 @@ def main():
             print(f"\nScan complete. No matching files found to merge (scanned {total_files_scanned} items).")
             return
 
-        # 4. Phase 1.5: Top 10 Review
+        # 4. Phase 1.5: Top 10 Review and Tree Generation
         files_to_merge.sort(key=lambda x: x[2], reverse=True)
         total_tokens = sum(f[2] for f in files_to_merge)
 
@@ -261,43 +285,29 @@ def main():
         print(f"Total files to merge: {len(files_to_merge)}")
         print(f"Total estimated tokens: {total_tokens}")
         print("-" * 70)
+        
+        # Generate the project tree string from the final list of files
+        relative_paths_for_tree = [f[1] for f in files_to_merge]
+        project_tree_str = generate_project_tree(relative_paths_for_tree, root_dir.name)
 
-        # 5. Phase 2: Confirm and Merge
-        proceed = False
-        if args.yes:
-            print("Auto-confirming with --yes flag.")
-            proceed = True
-        else:
-            try:
-                choice = input(f"> Proceed with merging {len(files_to_merge)} files? (Y/n): ").strip().lower()
-                if choice != 'n':
-                    proceed = True
-            except KeyboardInterrupt:
-                print("\nOperation cancelled.", file=sys.stderr)
-                sys.exit(0)
+        # 5. Phase 2: Merge files
+        try:
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write(f"# --- flatcode: Project Context Snapshot --- #\n")
+                f.write(f"# Root: {root_dir}\n")
+                f.write(f"# Files: {len(files_to_merge)}\n")
+                f.write(f"# Est. Tokens: {total_tokens}\n")
+                f.write(f"# --- Project Tree --- #\n")
+                f.write(project_tree_str)
+                f.write(f"# --- Start of Context --- #\n\n")
 
-        if proceed:
-            print(f"\n--- Phase 2: Merging files into {output_file.name} ---")
-            try:
-                with open(output_file, "w", encoding="utf-8") as f:
-                    f.write(f"# --- flatcode: Project Context Snapshot --- #\n")
-                    f.write(f"# Root: {root_dir}\n")
-                    f.write(f"# Files: {len(files_to_merge)}\n")
-                    f.write(f"# Est. Tokens: {total_tokens}\n")
-                    f.write(f"# --- Start of Context --- #\n\n")
-
-                    for path, rel_path, tokens, content in files_to_merge:
-                        print(f"  > Merging: {rel_path}")
-                        f.write(f"--- File: {rel_path} ---\n\n")
-                        f.write(content)
-                        f.write(f"\n\n--- End: {rel_path} ---\n\n")
-                
-                print(f"\n--- Success! ---")
-                print(f"Project context successfully merged into: {output_file}")
-            except IOError as e:
-                print(f"\n*** Error writing to output file: {e} ***", file=sys.stderr)
-        else:
-            print("Operation cancelled.")
+                for path, rel_path, tokens, content in files_to_merge:
+                    f.write(f"--- File: {rel_path} ---\n\n")
+                    f.write(content)
+                    f.write(f"\n\n--- End: {rel_path} ---\n\n")
+            
+        except IOError as e:
+            print(f"\n*** Error writing to output file: {e} ***", file=sys.stderr)
             
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.", file=sys.stderr)
