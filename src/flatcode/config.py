@@ -14,4 +14,5 @@ DEFAULT_IGNORE_PATTERNS = [
     ".DS_Store",
     "*.log",
     "logs/",
+    "*_context.txt",
 ]

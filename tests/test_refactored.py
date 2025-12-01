@@ -148,3 +148,41 @@ def test_cli_dynamic_naming(complex_project, monkeypatch):
     
     assert expected_file_path.exists()
     print(f"Successfully generated dynamic file: {expected_file_path.name}")
+
+def test_mergeignore_auto_append(tmp_path):
+    """
+    [New] 验证如果 .mergeignore 存在但缺少当前输出文件，会自动追加。
+    """
+    # 1. 创建现有的 .mergeignore，只包含 *.log
+    ignore_file = tmp_path / ".mergeignore"
+    ignore_file.write_text("*.log\n", encoding="utf-8")
+    
+    # 2. 模拟运行 flatcode，输出文件为 custom_context.txt
+    from flatcode.core.ignore import bootstrap_mergeignore
+    output_name = "custom_context.txt"
+    
+    bootstrap_mergeignore(tmp_path, output_name)
+    
+    # 3. 验证文件内容被修改
+    content = ignore_file.read_text(encoding="utf-8")
+    assert "custom_context.txt" in content
+    assert "# Auto-added output file" in content
+
+def test_mergeignore_no_duplication(tmp_path):
+    """
+    [New] 验证如果文件已经被忽略（例如通过通配符），则不会重复追加。
+    """
+    # 1. 规则包含 *_context.txt
+    ignore_file = tmp_path / ".mergeignore"
+    ignore_file.write_text("*_context.txt\n", encoding="utf-8")
+    
+    # 2. 运行，输出 my_project_context.txt (符合通配符)
+    from flatcode.core.ignore import bootstrap_mergeignore
+    output_name = "my_project_context.txt"
+    
+    bootstrap_mergeignore(tmp_path, output_name)
+    
+    # 3. 验证没有重复添加
+    content = ignore_file.read_text(encoding="utf-8")
+    # 应该只出现一次（即原有的规则），不会有具体的 my_project_context.txt
+    assert "my_project_context.txt" not in content
