@@ -128,3 +128,23 @@ def test_cli_integration(complex_project, monkeypatch):
     content = output_file.read_text(encoding="utf-8")
     assert "src/main.py" in content
     assert "logs/app.log" not in content
+
+
+def test_cli_dynamic_naming(complex_project, monkeypatch):
+    """
+    [New] 验证未指定 -o 时，是否根据目录名动态生成文件名
+    """
+    # complex_project 是一个临时目录，比如 /tmp/pytest-of-user/pytest-1/complex_project0
+    dir_name = complex_project.name
+    expected_filename = f"{dir_name}_context.txt"
+    expected_file_path = complex_project / expected_filename
+    
+    # 不传 -o 参数
+    test_args = ["flatcode", str(complex_project), "-y"]
+    
+    with patch.object(sys, "argv", test_args):
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+        main()
+    
+    assert expected_file_path.exists()
+    print(f"Successfully generated dynamic file: {expected_file_path.name}")

@@ -1,0 +1,1219 @@
+# --- flatcode Context ---
+# Files: 18 | Tokens: 7726
+# --- Project Tree ---
+flatcode/
+├── .github
+│   └── workflows
+│       └── test.yml
+├── .gitignore
+├── .mergeignore
+├── LICENSE
+├── README.md
+├── pyproject.toml
+├── src
+│   └── flatcode
+│       ├── __init__.py
+│       ├── __main__.py
+│       ├── cli.py
+│       ├── config.py
+│       ├── core
+│       │   ├── __init__.py
+│       │   ├── ignore.py
+│       │   ├── scanner.py
+│       │   └── tree.py
+│       ├── models.py
+│       └── utils
+│           ├── __init__.py
+│           └── tokenizer.py
+└── tests
+    └── test_refactored.py
+# --- Context Start ---
+
+--- File: tests/test_refactored.py ---
+
+# tests/test_refactored.py
+
+import sys
+import pytest
+from pathlib import Path
+import pathspec
+
+# 确保 src 在路径中
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from flatcode.core.scanner import ProjectScanner
+# [Change] load_ignore_rules -> load_ignore_spec, is_path_ignored is removed
+from flatcode.core.ignore import load_ignore_spec
+from flatcode.core.tree import generate_project_tree
+from flatcode.cli import main
+from unittest.mock import patch
+
+# --- Fixtures ---
+
+@pytest.fixture
+def complex_project(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.py").write_text("print('hello')", encoding="utf-8")
+    
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "app.log").write_text("error", encoding="utf-8")
+    
+    (tmp_path / ".mergeignore").write_text("logs/\n", encoding="utf-8")
+    
+    return tmp_path
+
+# --- 1. Ignore Logic Tests (Using PathSpec) ---
+
+def test_ignore_spec_loading(tmp_path):
+    """验证 PathSpec 对象的正确加载"""
+    ignore_file = tmp_path / ".mergeignore"
+    ignore_file.write_text("node_modules/\n*.log", encoding="utf-8")
+    
+    spec = load_ignore_spec(ignore_file)
+    
+    # PathSpec 测试
+    assert spec.match_file("node_modules/") is True
+    assert spec.match_file("app.log") is True
+    assert spec.match_file("src/main.py") is False
+
+def test_ignore_spec_extra_patterns(tmp_path):
+    """验证额外的模式（如 output file）是否被包含"""
+    ignore_file = tmp_path / ".mergeignore"
+    ignore_file.write_text("", encoding="utf-8") # Empty file
+    
+    # 模拟 CLI 传入 output filename
+    spec = load_ignore_spec(ignore_file, extra_patterns=["output.txt"])
+    
+    assert spec.match_file("output.txt") is True
+
+# --- 2. Scanner Tests ---
+
+def test_scanner_pruning_performance(tmp_path):
+    """
+    验证 os.walk 配合 PathSpec 的剪枝能力。
+    """
+    ign_dir = tmp_path / "node_modules"
+    deep_dir = ign_dir / "deep" / "nested"
+    deep_dir.mkdir(parents=True)
+    (deep_dir / "index.js").write_text("console.log('heavy')", encoding="utf-8")
+    (tmp_path / "main.py").write_text("print('ok')", encoding="utf-8")
+    
+    # 构造 Spec
+    spec = pathspec.PathSpec.from_lines("gitwildmatch", ["node_modules/"])
+    extensions = {"*"}
+    
+    scanner = ProjectScanner(tmp_path, spec, extensions)
+    results = list(scanner.scan())
+    paths = [f.rel_path for f in results]
+    
+    assert "main.py" in paths
+    assert "node_modules/deep/nested/index.js" not in paths
+
+def test_scanner_wildcard_glob(tmp_path):
+    """
+    [New] 验证 pathspec 的高级匹配能力 (** 递归)
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "test.js").write_text("...", encoding="utf-8")
+    (src / "ignore_me.js").write_text("...", encoding="utf-8")
+    
+    # 规则：忽略所有目录下的 ignore_*.js
+    spec = pathspec.PathSpec.from_lines("gitwildmatch", ["**/ignore_*.js"])
+    extensions = {"*"}
+    
+    scanner = ProjectScanner(tmp_path, spec, extensions)
+    results = list(scanner.scan())
+    paths = [f.rel_path for f in results]
+    
+    assert "src/test.js" in paths
+    assert "src/ignore_me.js" not in paths
+
+def test_scanner_binary_guard(tmp_path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "info.txt").write_text("text", encoding="utf-8")
+    (assets / "logo.png").write_bytes(b"PNG\x00\x00") # Binary
+
+    spec = pathspec.PathSpec.from_lines("gitwildmatch", []) # Nothing ignored
+    extensions = {"*"}
+    
+    scanner = ProjectScanner(tmp_path, spec, extensions)
+    results = list(scanner.scan())
+    paths = [f.rel_path for f in results]
+    
+    assert "assets/info.txt" in paths
+    assert "assets/logo.png" not in paths
+
+# --- 3. CLI Integration ---
+
+def test_cli_integration(complex_project, monkeypatch):
+    output_file = complex_project / "output.txt"
+    test_args = ["flatcode", str(complex_project), "-o", output_file.name, "-y"]
+    
+    with patch.object(sys, "argv", test_args):
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+        main()
+    
+    assert output_file.exists()
+    content = output_file.read_text(encoding="utf-8")
+    assert "src/main.py" in content
+    assert "logs/app.log" not in content
+
+
+def test_cli_dynamic_naming(complex_project, monkeypatch):
+    """
+    [New] 验证未指定 -o 时，是否根据目录名动态生成文件名
+    """
+    # complex_project 是一个临时目录，比如 /tmp/pytest-of-user/pytest-1/complex_project0
+    dir_name = complex_project.name
+    expected_filename = f"{dir_name}_context.txt"
+    expected_file_path = complex_project / expected_filename
+    
+    # 不传 -o 参数
+    test_args = ["flatcode", str(complex_project), "-y"]
+    
+    with patch.object(sys, "argv", test_args):
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+        main()
+    
+    assert expected_file_path.exists()
+    print(f"Successfully generated dynamic file: {expected_file_path.name}")
+
+--- End: tests/test_refactored.py ---
+
+--- File: .mergeignore ---
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+#   For a library or package, you might want to ignore these files since the code is
+#   intended to run in multiple environments; otherwise, check them in:
+# .python-version
+
+# pipenv
+#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
+#   However, in case of collaboration, if having platform-specific dependencies or dependencies
+#   having no cross-platform support, pipenv may install dependencies that don't work, or not
+#   install all needed dependencies.
+#Pipfile.lock
+
+# UV
+#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
+#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   commonly ignored for libraries.
+#uv.lock
+
+# poetry
+#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
+#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   commonly ignored for libraries.
+#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
+#poetry.lock
+#poetry.toml
+
+# pdm
+#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
+#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
+#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
+#pdm.lock
+#pdm.toml
+.pdm-python
+.pdm-build/
+
+# pixi
+#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
+#pixi.lock
+#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
+#   in the .venv directory. It is recommended not to include this directory in version control.
+.pixi
+
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
+#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
+#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
+#  and can be added to the global gitignore or merged into this file.  For a more nuclear
+#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+#.idea/
+
+# Abstra
+# Abstra is an AI-powered process automation framework.
+# Ignore directories containing user credentials, local state, and settings.
+# Learn more at https://abstra.io/docs
+.abstra/
+
+# Visual Studio Code
+#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
+#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#  you could uncomment the following to ignore the entire vscode folder
+# .vscode/
+
+# Ruff stuff:
+.ruff_cache/
+
+# PyPI configuration file
+.pypirc
+
+# Cursor
+#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
+#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
+#  refer to https://docs.cursor.com/context/ignore-files
+.cursorignore
+.cursorindexingignore
+
+# Marimo
+marimo/_static/
+marimo/_lsp/
+__marimo__/
+
+# Exclude this tool's output
+merged_code_context.txt
+.git
+
+
+
+--- End: .mergeignore ---
+
+--- File: src/flatcode/cli.py ---
+
+# src/flatcode/cli.py
+import sys
+import argparse
+import os
+from pathlib import Path
+
+# Module imports
+from flatcode.core.ignore import bootstrap_mergeignore, load_ignore_spec
+from flatcode.core.scanner import ProjectScanner
+from flatcode.core.tree import generate_project_tree
+from flatcode.models import FileContext
+
+def create_arg_parser():
+    parser = argparse.ArgumentParser(
+        description="A smart CLI tool to 'flatten' your project's code into a single, LLM-friendly context file."
+    )
+    parser.add_argument("root_dir", type=str, nargs="?", default=os.getcwd(), help="Project root directory")
+    
+    # [Modify] 默认值改为 None，以便在 main 中动态生成
+    parser.add_argument(
+        "-o", "--output", 
+        type=str, 
+        default=None, 
+        help="Output filename (default: {folder_name}_context.txt)"
+    )
+    
+    parser.add_argument("-e", "--extensions", type=str, default="*", help="Comma-separated file extensions or '*' for all")
+    parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
+    return parser
+
+def get_default_output_name(root_dir: Path) -> str:
+    """Generates a dynamic filename based on the directory name."""
+    # 获取目录名称 (如 'backend')
+    folder_name = root_dir.name
+    
+    # 边界情况：如果是根目录或无法获取名称
+    if not folder_name:
+        folder_name = "project"
+        
+    # 简单的清理（可选）：将空格替换为下划线，防止文件名带空格
+    safe_name = folder_name.replace(" ", "_")
+    
+    return f"{safe_name}_context.txt"
+
+def main():
+    try:
+        # 1. Setup
+        parser = create_arg_parser()
+        args = parser.parse_args()
+        
+        root_dir = Path(args.root_dir).resolve()
+        if not root_dir.is_dir():
+            print(f"Error: Invalid directory '{root_dir}'", file=sys.stderr)
+            sys.exit(1)
+
+        # [Modify] 动态计算输出文件名
+        if args.output:
+            output_file_name = args.output
+        else:
+            output_file_name = get_default_output_name(root_dir)
+            
+        output_file = root_dir / output_file_name
+        
+        # Parse extensions
+        raw_exts = args.extensions.strip()
+        extensions = {"*"} if raw_exts == "*" else {e.strip() for e in raw_exts.split(",")}
+
+        print(f"--- flatcode ---")
+        print(f"Scanning: {root_dir}")
+        print(f"Output:   {output_file.name}") # 提示用户输出文件名
+        print(f"Mode:     {'All non-ignored text files' if '*' in extensions else f'Extensions {extensions}'}")
+
+        # 2. Ignore Rules (Using PathSpec)
+        # 传入 output_file_name 而不是 args.output，确保动态生成的文件名被添加到 ignore
+        mergeignore_file = bootstrap_mergeignore(root_dir, output_file_name)
+        
+        # Load spec and inject the output filename as an extra pattern to ignore
+        ignore_spec = load_ignore_spec(mergeignore_file, extra_patterns=[output_file_name])
+
+        # 3. Scanning
+        scanner = ProjectScanner(root_dir, ignore_spec, extensions)
+        files_to_merge: list[FileContext] = list(scanner.scan())
+        
+        if not files_to_merge:
+            print("No matching files found.")
+            return
+
+        # 4. Review & Stats
+        files_to_merge.sort(key=lambda x: x.token_count, reverse=True)
+        total_tokens = sum(f.token_count for f in files_to_merge)
+
+        print("\n--- Top 10 Largest Files (Est. Tokens) ---")
+        print(f"{'Rank':<5} | {'Tokens':<10} | {'File Path'}")
+        print("-" * 60)
+        for i, f in enumerate(files_to_merge[:10]):
+            print(f"{i+1:<5} | {f.token_count:<10} | {f.rel_path}")
+        print("-" * 60)
+        print(f"Total files: {len(files_to_merge)}")
+        print(f"Total tokens: {total_tokens}")
+        print("-" * 60)
+
+        if not args.yes:
+            pass 
+
+        # 5. Output Generation
+        tree_str = generate_project_tree([f.rel_path for f in files_to_merge], root_dir.name)
+        
+        try:
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write(f"# --- flatcode Context ---\n")
+                f.write(f"# Files: {len(files_to_merge)} | Tokens: {total_tokens}\n")
+                f.write(f"# --- Project Tree ---\n")
+                f.write(tree_str)
+                f.write(f"# --- Context Start ---\n\n")
+                
+                for fc in files_to_merge:
+                    f.write(f"--- File: {fc.rel_path} ---\n\n")
+                    f.write(fc.content)
+                    f.write(f"\n\n--- End: {fc.rel_path} ---\n\n")
+            print(f"\nSuccess! Context written to: {output_file.name}")
+            
+        except IOError as e:
+            print(f"Error writing file: {e}", file=sys.stderr)
+
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(1)
+
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
+--- End: src/flatcode/cli.py ---
+
+--- File: .gitignore ---
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+#   For a library or package, you might want to ignore these files since the code is
+#   intended to run in multiple environments; otherwise, check them in:
+# .python-version
+
+# pipenv
+#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
+#   However, in case of collaboration, if having platform-specific dependencies or dependencies
+#   having no cross-platform support, pipenv may install dependencies that don't work, or not
+#   install all needed dependencies.
+#Pipfile.lock
+
+# UV
+#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
+#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   commonly ignored for libraries.
+#uv.lock
+
+# poetry
+#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
+#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   commonly ignored for libraries.
+#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
+#poetry.lock
+#poetry.toml
+
+# pdm
+#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
+#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
+#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
+#pdm.lock
+#pdm.toml
+.pdm-python
+.pdm-build/
+
+# pixi
+#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
+#pixi.lock
+#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
+#   in the .venv directory. It is recommended not to include this directory in version control.
+.pixi
+
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
+#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
+#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
+#  and can be added to the global gitignore or merged into this file.  For a more nuclear
+#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+#.idea/
+
+# Abstra
+# Abstra is an AI-powered process automation framework.
+# Ignore directories containing user credentials, local state, and settings.
+# Learn more at https://abstra.io/docs
+.abstra/
+
+# Visual Studio Code
+#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
+#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#  you could uncomment the following to ignore the entire vscode folder
+# .vscode/
+
+# Ruff stuff:
+.ruff_cache/
+
+# PyPI configuration file
+.pypirc
+
+# Cursor
+#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
+#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
+#  refer to https://docs.cursor.com/context/ignore-files
+.cursorignore
+.cursorindexingignore
+
+# Marimo
+marimo/_static/
+marimo/_lsp/
+__marimo__/
+merged_code_context.txt
+
+--- End: .gitignore ---
+
+--- File: src/flatcode/core/scanner.py ---
+
+# src/flatcode/core/scanner.py
+import sys
+import os
+from pathlib import Path
+from typing import Iterator, Set
+import pathspec
+
+from flatcode.models import FileContext
+from flatcode.utils.tokenizer import Tokenizer
+
+class ProjectScanner:
+    def __init__(self, root_dir: Path, ignore_spec: pathspec.PathSpec, extensions: Set[str]):
+        self.root_dir = root_dir
+        self.ignore_spec = ignore_spec
+        self.extensions = extensions
+        self.match_all = "*" in extensions
+
+    def _is_binary_file(self, path: Path) -> bool:
+        """
+        Reads the first 1024 bytes to check for null bytes.
+        Returns True if likely binary, False if likely text.
+        """
+        try:
+            with path.open("rb") as f:
+                chunk = f.read(1024)
+                return b'\0' in chunk
+        except Exception:
+            return True
+
+    def scan(self) -> Iterator[FileContext]:
+        """
+        Walks the directory tree, pruning ignored directories efficiently,
+        and yields FileContext objects for valid text files.
+        """
+        for root, dirs, files in os.walk(self.root_dir):
+            root_path = Path(root)
+            
+            # --- 1. Prune Directories ---
+            # Remove ignored directories from 'dirs' to prevent descending into them.
+            # Iterating backwards or over a copy to allow safe removal.
+            for d in list(dirs):
+                dir_abs_path = root_path / d
+                try:
+                    dir_rel_path = dir_abs_path.relative_to(self.root_dir)
+                except ValueError:
+                    continue
+
+                # IMPORTANT: We append '/' to tell pathspec this is a directory.
+                # Git rules like "node_modules/" match directories specifically.
+                check_path = dir_rel_path.as_posix() + "/"
+                
+                if self.ignore_spec.match_file(check_path):
+                    dirs.remove(d)
+
+            # --- 2. Process Files ---
+            for f in files:
+                file_abs_path = root_path / f
+                try:
+                    rel_path = file_abs_path.relative_to(self.root_dir)
+                except ValueError:
+                    continue
+                
+                rel_path_str = rel_path.as_posix()
+
+                # A. Ignore Check (PathSpec)
+                if self.ignore_spec.match_file(rel_path_str):
+                    continue
+
+                # B. Extension Check
+                if not self.match_all:
+                    # Using path suffix check
+                    if not (file_abs_path.suffix in self.extensions or file_abs_path.name in self.extensions):
+                        continue
+
+                # C. Binary Check
+                if self._is_binary_file(file_abs_path):
+                    continue
+
+                try:
+                    content = file_abs_path.read_text(encoding="utf-8")
+                    tokens = Tokenizer.count(content)
+                    yield FileContext(
+                        path=file_abs_path,
+                        rel_path=rel_path_str,
+                        content=content,
+                        token_count=tokens
+                    )
+                except UnicodeDecodeError:
+                    continue
+                except Exception as e:
+                    print(f"  > [Warning] Skipping {rel_path_str} (read error: {e})", file=sys.stderr)
+
+--- End: src/flatcode/core/scanner.py ---
+
+--- File: src/flatcode/core/ignore.py ---
+
+# src/flatcode/core/ignore.py
+import sys
+from pathlib import Path
+from typing import List, Optional
+import pathspec
+from flatcode.config import DEFAULT_IGNORE_PATTERNS
+
+def bootstrap_mergeignore(root_dir: Path, output_filename: str) -> Path:
+    """Checks for .mergeignore; creates one if it doesn't exist."""
+    mergeignore_file = root_dir / ".mergeignore"
+    if mergeignore_file.exists():
+        print(f"Found existing: {mergeignore_file.name}")
+        return mergeignore_file
+
+    print(f"'{mergeignore_file.name}' not found. Initializing...")
+    gitignore_file = root_dir / ".gitignore"
+    
+    try:
+        patterns_to_write = []
+        if gitignore_file.exists():
+            # In a real app, dependency injection for input() is better
+            choice = input(f"> Found .gitignore. Copy rules to .mergeignore? (Y/n): ").strip().lower()
+            if choice != 'n':
+                with open(gitignore_file, "r", encoding="utf-8") as f_git:
+                    patterns_to_write.extend(f_git.read().splitlines())
+                print(f"Copied rules from .gitignore.")
+        
+        if not patterns_to_write:
+            patterns_to_write = DEFAULT_IGNORE_PATTERNS
+        
+        # Ensure the output file itself is always ignored
+        if output_filename not in patterns_to_write:
+            patterns_to_write.append(f"\n# Exclude this tool's output\n{output_filename}")
+
+        with open(mergeignore_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(patterns_to_write))
+        
+        print(f"Successfully created: {mergeignore_file.name}")
+        return mergeignore_file
+
+    except Exception as e:
+        print(f"Error creating .mergeignore: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def load_ignore_spec(mergeignore_file: Path, extra_patterns: Optional[List[str]] = None) -> pathspec.PathSpec:
+    """
+    Loads rules from .mergeignore and creates a PathSpec object.
+    Includes any extra patterns (like the output filename).
+    """
+    lines = []
+    
+    # 1. Read file if exists
+    if mergeignore_file.exists():
+        with open(mergeignore_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    
+    # 2. Add extra patterns (e.g., output file)
+    if extra_patterns:
+        lines.extend(extra_patterns)
+
+    # 3. Create spec using GitWildMatch (standard git behavior)
+    try:
+        spec = pathspec.PathSpec.from_lines("gitwildmatch", lines)
+        return spec
+    except Exception as e:
+        print(f"Error parsing ignore rules: {e}", file=sys.stderr)
+        # Return an empty spec on failure to prevent crash, though risky
+        return pathspec.PathSpec.from_lines("gitwildmatch", [])
+
+--- End: src/flatcode/core/ignore.py ---
+
+--- File: pyproject.toml ---
+
+# pyproject.toml
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flatcode"
+version = "0.1.3"
+authors = [
+    { name="jaywang98", email="cryptojayw@gmail.com" },
+]
+description = "A smart CLI tool to 'flatten' your project's code into a single, LLM-friendly context file."
+readme = "README.md"
+requires-python = ">=3.7"
+license = { file = "LICENSE" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "tiktoken",
+    "pathspec>=0.11.0"
+]
+
+[project.scripts]
+flatcode = "flatcode.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/jaywang98/flatcode"
+Issues = "https://github.com/jaywang98/flatcode/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "build",
+    "twine",
+]
+test = [
+    "pytest",
+    "pytest-cov",
+]
+
+# Configuration for Pytest
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q"
+testpaths = [
+    "tests",
+]
+# Tells pytest to add 'src' to the path, fixing import errors
+pythonpath = [
+    "src"
+]
+
+--- End: pyproject.toml ---
+
+--- File: .github/workflows/test.yml ---
+
+# .github/workflows/test.yml
+
+name: Run Python Tests
+
+# Controls when the action will run
+on:
+  push:
+    branches: [ "main", "develop" ]  # Run on pushes to main and develop
+  pull_request:
+    branches: [ "main" ]         # Run on pull requests targeting main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest  # Use the latest Linux environment
+    strategy:
+      matrix:
+        # Test against multiple Python versions
+        python-version: ["3.8", "3.9", "3.10", "3.11"]
+
+    steps:
+      # 1. Check out the repository code
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # 2. Set up the specific version of Python
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # 3. Install dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install the package itself in editable mode
+          # and include the 'test' dependencies (pytest)
+          pip install -e .[test]
+
+      # 4. Run tests
+      - name: Run tests with pytest
+        run: |
+          pytest
+
+--- End: .github/workflows/test.yml ---
+
+--- File: src/flatcode/core/tree.py ---
+
+# src/flatcode/core/tree.py
+from typing import List, Dict
+from pathlib import Path
+
+def generate_project_tree(file_paths: List[str], root_name: str) -> str:
+    """Generates a string representation of the project tree."""
+    tree_dict: Dict = {}
+    for path in sorted(file_paths):
+        parts = Path(path).parts
+        current_level = tree_dict
+        for part in parts:
+            if part not in current_level:
+                current_level[part] = {}
+            current_level = current_level[part]
+
+    lines = [f"{root_name}/"]
+
+    def _generate_lines_recursive(subtree: Dict, prefix: str):
+        entries = sorted(subtree.items())
+        for i, (name, content) in enumerate(entries):
+            is_last = (i == len(entries) - 1)
+            connector = "└── " if is_last else "├── "
+            lines.append(f"{prefix}{connector}{name}")
+            
+            if content:
+                new_prefix = prefix + ("    " if is_last else "│   ")
+                _generate_lines_recursive(content, new_prefix)
+
+    _generate_lines_recursive(tree_dict, "")
+    return "\n".join(lines) + "\n"
+
+
+--- End: src/flatcode/core/tree.py ---
+
+--- File: src/flatcode/utils/tokenizer.py ---
+
+# src/flatcode/utils/tokenizer.py
+import sys
+from functools import lru_cache
+
+try:
+    import tiktoken
+except ImportError:
+    # 这里的错误处理通常在 CLI 层做，但在 Utils 层若缺失可抛出 ImportError
+    tiktoken = None
+
+class Tokenizer:
+    _encoding = None
+
+    @classmethod
+    def get_encoding(cls):
+        if cls._encoding is None:
+            if tiktoken is None:
+                raise ImportError("tiktoken not installed")
+            try:
+                cls._encoding = tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                # Fallback
+                cls._encoding = tiktoken.get_encoding("p50k_base")
+        return cls._encoding
+
+    @staticmethod
+    def count(text: str) -> int:
+        """Estimates token count for a given text."""
+        try:
+            encoding = Tokenizer.get_encoding()
+            return len(encoding.encode(text))
+        except Exception:
+            # Fallback estimation strategy
+            return len(text) // 4
+
+
+--- End: src/flatcode/utils/tokenizer.py ---
+
+--- File: LICENSE ---
+
+MIT License
+
+Copyright (c) 2025 Jay
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+--- End: LICENSE ---
+
+--- File: src/flatcode/config.py ---
+
+# src/flatcode/config.py
+
+DEFAULT_IGNORE_PATTERNS = [
+    "# Default ignore patterns",
+    ".git/",
+    "node_modules/",
+    "venv/",
+    ".venv/",
+    "__pycache__/",
+    "dist/",
+    "build/",
+    ".vscode/",
+    ".idea/",
+    ".DS_Store",
+    "*.log",
+    "logs/",
+]
+
+
+--- End: src/flatcode/config.py ---
+
+--- File: src/flatcode/models.py ---
+
+# src/flatcode/models.py
+from dataclasses import dataclass
+from pathlib import Path
+
+@dataclass(frozen=True)
+class FileContext:
+    """Immutable data class holding file information."""
+    path: Path
+    rel_path: str
+    content: str
+    token_count: int
+
+
+--- End: src/flatcode/models.py ---
+
+--- File: src/flatcode/__main__.py ---
+
+# src/flatcode/__main__.py
+from flatcode.cli import main
+
+if __name__ == "__main__":
+    main()
+
+
+--- End: src/flatcode/__main__.py ---
+
+--- File: README.md ---
+
+# flatcode
+A smart CLI tool to flatten a project repository into a single, token-efficient context file for LLM analysis
+
+
+--- End: README.md ---
+
+--- File: src/flatcode/core/__init__.py ---
+
+# src/flatcode/core/__init__.py
+
+
+--- End: src/flatcode/core/__init__.py ---
+
+--- File: src/flatcode/utils/__init__.py ---
+
+# src/flatcode/utils/__init__.py
+
+
+--- End: src/flatcode/utils/__init__.py ---
+
+--- File: src/flatcode/__init__.py ---
+
+# src/flatcode/__init__.py
+
+
+--- End: src/flatcode/__init__.py ---
+
