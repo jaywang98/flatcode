@@ -1,8 +1,8 @@
 # src/flatcode/core/ignore.py
 import sys
-import fnmatch
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional
+import pathspec
 from flatcode.config import DEFAULT_IGNORE_PATTERNS
 
 def bootstrap_mergeignore(root_dir: Path, output_filename: str) -> Path:
@@ -18,6 +18,7 @@ def bootstrap_mergeignore(root_dir: Path, output_filename: str) -> Path:
     try:
         patterns_to_write = []
         if gitignore_file.exists():
+            # In a real app, dependency injection for input() is better
             choice = input(f"> Found .gitignore. Copy rules to .mergeignore? (Y/n): ").strip().lower()
             if choice != 'n':
                 with open(gitignore_file, "r", encoding="utf-8") as f_git:
@@ -41,54 +42,27 @@ def bootstrap_mergeignore(root_dir: Path, output_filename: str) -> Path:
         print(f"Error creating .mergeignore: {e}", file=sys.stderr)
         sys.exit(1)
 
-def load_ignore_rules(mergeignore_file: Path) -> List[Tuple[str, bool]]:
-    rules = []
-    if not mergeignore_file.exists():
-        return rules
-    
-    with open(mergeignore_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("!"):
-                rules.append((line[1:].strip(), True))
-            else:
-                rules.append((line.strip(), False))
-    return rules
-
-def is_path_ignored(rel_path: Path, rules: List[Tuple[str, bool]], is_directory: bool = False) -> bool:
+def load_ignore_spec(mergeignore_file: Path, extra_patterns: Optional[List[str]] = None) -> pathspec.PathSpec:
     """
-    Checks if a path should be ignored.
-    :param is_directory: Hint to help match patterns ending in '/' against directory paths without the slash.
+    Loads rules from .mergeignore and creates a PathSpec object.
+    Includes any extra patterns (like the output filename).
     """
-    rel_path_posix = rel_path.as_posix()
+    lines = []
     
-    # If checking a directory "venv" against "venv/", we append a slash to force matching logic
-    if is_directory and not rel_path_posix.endswith("/"):
-        check_path = rel_path_posix + "/"
-    else:
-        check_path = rel_path_posix
+    # 1. Read file if exists
+    if mergeignore_file.exists():
+        with open(mergeignore_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    
+    # 2. Add extra patterns (e.g., output file)
+    if extra_patterns:
+        lines.extend(extra_patterns)
 
-    ignored = False
-    
-    for pattern, is_inclusion in rules:
-        match = False
-        
-        # 1. Directory-specific pattern (ends with /)
-        if pattern.endswith('/'):
-            # If pattern is "venv/", matches "venv/" (directory) or "venv/lib/..."
-            if check_path.startswith(pattern) or check_path == pattern:
-                match = True
-        
-        # 2. General pattern (glob)
-        else:
-            # Match full path or file name
-            # e.g. "*.log" matches "logs/app.log" (via name)
-            if fnmatch.fnmatch(rel_path_posix, pattern) or fnmatch.fnmatch(rel_path.name, pattern):
-                match = True
-        
-        if match:
-            ignored = not is_inclusion
-            
-    return ignored
+    # 3. Create spec using GitWildMatch (standard git behavior)
+    try:
+        spec = pathspec.PathSpec.from_lines("gitwildmatch", lines)
+        return spec
+    except Exception as e:
+        print(f"Error parsing ignore rules: {e}", file=sys.stderr)
+        # Return an empty spec on failure to prevent crash, though risky
+        return pathspec.PathSpec.from_lines("gitwildmatch", [])

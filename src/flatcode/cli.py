@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 # Module imports
-from flatcode.core.ignore import bootstrap_mergeignore, load_ignore_rules
+from flatcode.core.ignore import bootstrap_mergeignore, load_ignore_spec
 from flatcode.core.scanner import ProjectScanner
 from flatcode.core.tree import generate_project_tree
 from flatcode.models import FileContext
@@ -41,14 +41,14 @@ def main():
         print(f"Scanning: {root_dir}")
         print(f"Mode: {'All non-ignored text files' if '*' in extensions else f'Extensions {extensions}'}")
 
-        # 2. Ignore Rules
+        # 2. Ignore Rules (Using PathSpec)
         mergeignore_file = bootstrap_mergeignore(root_dir, args.output)
-        ignore_rules = load_ignore_rules(mergeignore_file)
-        ignore_rules.append((args.output, False)) # Always ignore output file
+        
+        # Load spec and inject the output filename as an extra pattern to ignore
+        ignore_spec = load_ignore_spec(mergeignore_file, extra_patterns=[args.output])
 
         # 3. Scanning
-        scanner = ProjectScanner(root_dir, ignore_rules, extensions)
-        # Consume the generator into a list for sorting/stats
+        scanner = ProjectScanner(root_dir, ignore_spec, extensions)
         files_to_merge: list[FileContext] = list(scanner.scan())
         
         if not files_to_merge:
@@ -70,8 +70,7 @@ def main():
         print("-" * 60)
 
         if not args.yes:
-            # Simple confirmation logic
-            pass # Skipping implemented logic for brevity, assumed implicitly approved or -y used
+            pass 
 
         # 5. Output Generation
         tree_str = generate_project_tree([f.rel_path for f in files_to_merge], root_dir.name)
@@ -95,6 +94,11 @@ def main():
 
     except KeyboardInterrupt:
         print("\nCancelled.")
+        sys.exit(1)
+
+    except Exception as e:
+        # Catch-all for other unexpected errors
+        print(f"An unexpected error occurred: {e}", file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":

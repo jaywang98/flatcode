@@ -2,16 +2,16 @@
 import sys
 import os
 from pathlib import Path
-from typing import Iterator, Set, List, Tuple
+from typing import Iterator, Set
+import pathspec
 
 from flatcode.models import FileContext
-from flatcode.core.ignore import is_path_ignored
 from flatcode.utils.tokenizer import Tokenizer
 
 class ProjectScanner:
-    def __init__(self, root_dir: Path, ignore_rules: List[Tuple[str, bool]], extensions: Set[str]):
+    def __init__(self, root_dir: Path, ignore_spec: pathspec.PathSpec, extensions: Set[str]):
         self.root_dir = root_dir
-        self.ignore_rules = ignore_rules
+        self.ignore_spec = ignore_spec
         self.extensions = extensions
         self.match_all = "*" in extensions
 
@@ -25,7 +25,6 @@ class ProjectScanner:
                 chunk = f.read(1024)
                 return b'\0' in chunk
         except Exception:
-            # If we can't read it (permission, etc), treat as unsafe/binary
             return True
 
     def scan(self) -> Iterator[FileContext]:
@@ -33,26 +32,25 @@ class ProjectScanner:
         Walks the directory tree, pruning ignored directories efficiently,
         and yields FileContext objects for valid text files.
         """
-        # 使用 os.walk 可以让我们修改 dirs 列表，从而阻止进入被忽略的目录 (Pruning)
         for root, dirs, files in os.walk(self.root_dir):
             root_path = Path(root)
             
-            # --- 1. Prune Directories (In-place modification of dirs) ---
-            # 这里的 dirs 是一个列表，os.walk 会根据它决定下一步进入哪里。
-            # 我们通过倒序遍历安全地移除元素。
+            # --- 1. Prune Directories ---
+            # Remove ignored directories from 'dirs' to prevent descending into them.
+            # Iterating backwards or over a copy to allow safe removal.
             for d in list(dirs):
                 dir_abs_path = root_path / d
                 try:
                     dir_rel_path = dir_abs_path.relative_to(self.root_dir)
                 except ValueError:
-                    continue # Should not happen in standard walk
+                    continue
 
-                # Check if directory should be ignored
-                # We pass is_directory=True to handle "venv/" vs "venv" matching
-                if is_path_ignored(dir_rel_path, self.ignore_rules, is_directory=True):
+                # IMPORTANT: We append '/' to tell pathspec this is a directory.
+                # Git rules like "node_modules/" match directories specifically.
+                check_path = dir_rel_path.as_posix() + "/"
+                
+                if self.ignore_spec.match_file(check_path):
                     dirs.remove(d)
-                    # Optional: Debug output
-                    # print(f"  [Debug] Pruning directory: {dir_rel_path}")
 
             # --- 2. Process Files ---
             for f in files:
@@ -61,19 +59,21 @@ class ProjectScanner:
                     rel_path = file_abs_path.relative_to(self.root_dir)
                 except ValueError:
                     continue
+                
+                rel_path_str = rel_path.as_posix()
 
-                # A. Ignore Check
-                if is_path_ignored(rel_path, self.ignore_rules, is_directory=False):
+                # A. Ignore Check (PathSpec)
+                if self.ignore_spec.match_file(rel_path_str):
                     continue
 
-                # B. Extension Check (Skip if match_all is True)
+                # B. Extension Check
                 if not self.match_all:
+                    # Using path suffix check
                     if not (file_abs_path.suffix in self.extensions or file_abs_path.name in self.extensions):
                         continue
 
-                # C. Binary Check & Read
+                # C. Binary Check
                 if self._is_binary_file(file_abs_path):
-                    # Silently skip binary files (or log in verbose mode)
                     continue
 
                 try:
@@ -81,12 +81,11 @@ class ProjectScanner:
                     tokens = Tokenizer.count(content)
                     yield FileContext(
                         path=file_abs_path,
-                        rel_path=rel_path.as_posix(),
+                        rel_path=rel_path_str,
                         content=content,
                         token_count=tokens
                     )
                 except UnicodeDecodeError:
-                    # Double safety: mostly caught by _is_binary_file, but just in case
                     continue
                 except Exception as e:
-                    print(f"  > [Warning] Skipping {rel_path.as_posix()} (read error: {e})", file=sys.stderr)
+                    print(f"  > [Warning] Skipping {rel_path_str} (read error: {e})", file=sys.stderr)

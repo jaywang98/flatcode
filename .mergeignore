@@ -208,4 +208,5 @@ __marimo__/
 
 # Exclude this tool's output
 merged_code_context.txt
+.git
 
