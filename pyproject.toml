@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flatcode"
-version = "0.1.2"
+version = "0.1.3"
 authors = [
     { name="jaywang98", email="cryptojayw@gmail.com" },
 ]
@@ -23,7 +23,8 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
-    "tiktoken"
+    "tiktoken",
+    "pathspec>=0.11.0"
 ]
 
 [project.scripts]

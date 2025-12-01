@@ -18,8 +18,6 @@ def bootstrap_mergeignore(root_dir: Path, output_filename: str) -> Path:
     try:
         patterns_to_write = []
         if gitignore_file.exists():
-            # 注意：在重构中，input() 等副作用最好通过依赖注入处理，
-            # 但为了保持简单，这里暂时保留
             choice = input(f"> Found .gitignore. Copy rules to .mergeignore? (Y/n): ").strip().lower()
             if choice != 'n':
                 with open(gitignore_file, "r", encoding="utf-8") as f_git:
@@ -59,16 +57,34 @@ def load_ignore_rules(mergeignore_file: Path) -> List[Tuple[str, bool]]:
                 rules.append((line.strip(), False))
     return rules
 
-def is_path_ignored(rel_path: Path, rules: List[Tuple[str, bool]]) -> bool:
+def is_path_ignored(rel_path: Path, rules: List[Tuple[str, bool]], is_directory: bool = False) -> bool:
+    """
+    Checks if a path should be ignored.
+    :param is_directory: Hint to help match patterns ending in '/' against directory paths without the slash.
+    """
     rel_path_posix = rel_path.as_posix()
+    
+    # If checking a directory "venv" against "venv/", we append a slash to force matching logic
+    if is_directory and not rel_path_posix.endswith("/"):
+        check_path = rel_path_posix + "/"
+    else:
+        check_path = rel_path_posix
+
     ignored = False
     
     for pattern, is_inclusion in rules:
         match = False
+        
+        # 1. Directory-specific pattern (ends with /)
         if pattern.endswith('/'):
-            if rel_path_posix.startswith(pattern):
+            # If pattern is "venv/", matches "venv/" (directory) or "venv/lib/..."
+            if check_path.startswith(pattern) or check_path == pattern:
                 match = True
+        
+        # 2. General pattern (glob)
         else:
+            # Match full path or file name
+            # e.g. "*.log" matches "logs/app.log" (via name)
             if fnmatch.fnmatch(rel_path_posix, pattern) or fnmatch.fnmatch(rel_path.name, pattern):
                 match = True
         
